@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Staff Check-In</title>
+<script defer src="https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js"></script>
+<style>
+  body { font-family: Arial, sans-serif; text-align: center; padding: 20px; background:#f5f5f5; }
+  #wrap { position: relative; width: 320px; max-width: 90vw; margin: 0 auto; }
+  video, canvas { position: absolute; top: 0; left: 0; width: 100%; border-radius: 12px; }
+  video { background:#000; }
+  #status { margin-top: 300px; font-size: 18px; font-weight: bold; min-height: 30px; padding: 10px; border-radius: 8px; }
+  .ok { color:#fff; background:#1a7f37; }
+  .err { color:#fff; background:#c0392b; }
+  .warn { color:#333; background:#ffd966; }
+  .info { color:#333; }
+</style>
+</head>
+<body>
+
+<!-- ⚠️ SET THIS to your Apps Script /exec URL before using -->
+<script>const BACKEND_URL = 'https://script.google.com/macros/s/AKfycbymYgKJcpdIUjb20sBSul_VAndcN3oerPxQG-4MLqqUHaEAFAwYrUua4F6_jI1V-I5b/exec';</script>
+
+<h2>Staff Check-In</h2>
+<p>Look at the camera. Blink naturally when prompted to confirm you're really there.</p>
+<div id="wrap">
+  <video id="video" autoplay muted playsinline width="320" height="240"></video>
+  <canvas id="overlay" width="320" height="240"></canvas>
+</div>
+<div id="status" class="info">Loading…</div>
+
+<script>
+const MODEL_URL = 'https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@master/weights';
+const MATCH_THRESHOLD = 0.5;   // lower = stricter face match
+const EAR_CLOSED = 0.21;       // eye-aspect-ratio below this = eyes closed
+const EAR_OPEN = 0.27;         // above this = eyes open again (a full blink cycle)
+const RECHECK_COOLDOWN_MS = 8000; // pause after a successful check-in
+
+const video = document.getElementById('video');
+const overlay = document.getElementById('overlay');
+const ctx = overlay.getContext('2d');
+const statusDiv = document.getElementById('status');
+
+let faceMatcher = null;
+let cooldownUntil = 0;
+let candidateId = null;
+let candidateSince = 0;
+let sawClosed = false;
+
+function setStatus(text, cls) { statusDiv.textContent = text; statusDiv.className = cls || 'info'; }
+
+function dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
+
+function earFor(eye) {
+  // eye = 6 landmark points, dlib ordering
+  return (dist(eye[1], eye[5]) + dist(eye[2], eye[4])) / (2 * dist(eye[0], eye[3]));
+}
+
+async function init() {
+  setStatus('Loading face recognition models…');
+  await Promise.all([
+    faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
+    faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
+    faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL)
+  ]);
+
+  const stream = await navigator.mediaDevices.getUserMedia({ video: {} });
+  video.srcObject = stream;
+  await new Promise(r => video.onloadedmetadata = r);
+
+  setStatus('Loading enrolled staff…');
+  const res = await fetch(BACKEND_URL + '?action=descriptors');
+  const list = await res.json();
+  if (!list.length) {
+    setStatus('No staff enrolled yet. Run enrollment first.', 'err');
+    return;
+  }
+  const labeled = list.map(s =>
+    new faceapi.LabeledFaceDescriptors(s.id + '|' + s.name, [new Float32Array(s.descriptor)])
+  );
+  faceMatcher = new faceapi.FaceMatcher(labeled, MATCH_THRESHOLD);
+
+  setStatus('Look at the camera…');
+  loop();
+}
+
+async function loop() {
+  requestAnimationFrame(loop);
+  if (Date.now() < cooldownUntil) return;
+
+  const options = new faceapi.TinyFaceDetectorOptions();
+  const detection = await faceapi.detectSingleFace(video, options).withFaceLandmarks().withFaceDescriptor();
+
+  ctx.clearRect(0, 0, overlay.width, overlay.height);
+  if (!detection) {
+    setStatus('No face detected — center your face in view.', 'info');
+    candidateId = null; sawClosed = false;
+    return;
+  }
+
+  const resized = faceapi.resizeResults(detection, { width: overlay.width, height: overlay.height });
+  faceapi.draw.drawDetections(overlay, resized);
+
+  const match = faceMatcher.findBestMatch(detection.descriptor);
+  if (match.label === 'unknown') {
+    setStatus('Face not recognized. Contact admin if this persists.', 'err');
+    candidateId = null; sawClosed = false;
+    return;
+  }
+
+  const [staffId, name] = match.label.split('|');
+
+  if (candidateId !== staffId) {
+    candidateId = staffId;
+    candidateSince = Date.now();
+    sawClosed = false;
+  }
+
+  // Blink / liveness check using eye-aspect-ratio over consecutive frames
+  const leftEAR = earFor(detection.landmarks.getLeftEye());
+  const rightEAR = earFor(detection.landmarks.getRightEye());
+  const ear = (leftEAR + rightEAR) / 2;
+
+  if (ear < EAR_CLOSED) {
+    sawClosed = true;
+    setStatus('Hi ' + name + ' — good, now open your eyes…', 'warn');
+  } else if (ear > EAR_OPEN && sawClosed) {
+    // Full blink cycle completed while matched to the same person — confirm
+    checkIn(staffId, name);
+  } else {
+    setStatus('Hi ' + name + ' — please blink to confirm.', 'warn');
+  }
+}
+
+async function checkIn(staffId, name) {
+  cooldownUntil = Date.now() + RECHECK_COOLDOWN_MS;
+  candidateId = null; sawClosed = false;
+  setStatus('Recording attendance for ' + name + '…', 'info');
+  try {
+    const res = await fetch(BACKEND_URL, {
+      method: 'POST',
+      body: JSON.stringify({ type: 'checkin', staffId })
+    });
+    const result = await res.json();
+    setStatus(result.message, result.status === 'success' ? 'ok' : 'warn');
+  } catch (err) {
+    setStatus('Network error recording attendance: ' + err.message, 'err');
+  }
+}
+
+init().catch(err => setStatus('Setup error: ' + err.message, 'err'));
+</script>
+</body>
+</html>
